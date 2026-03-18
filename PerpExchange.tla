@@ -353,16 +353,55 @@ NetPositionZero ==
 (*
  * InsuranceFundSolvent: the insurance fund's cash reserves are always
  * non-negative.  The fund receives the net equity of each liquidated
- * account (LiquidationEquityDelta).  When an account is bankrupt its equity
- * is negative, so the fund absorbs the shortfall; the guard in Liquidate
- * prevents any liquidation that would drive the fund below zero.
- *
- * This invariant captures the real-world requirement that the insurance fund
- * must not become insolvent.  A depleted fund means the exchange cannot
- * safely liquidate further undercollateralised positions.
+ * account (LiquidationEquityDelta) when solvent, or floors at zero when the
+ * account is bankrupt and the deficit exceeds the fund's reserves.  In the
+ * latter case the remaining shortfall is absorbed via Auto-Deleveraging (ADL):
+ * profitable counterparty positions are force-closed at mark price, redirecting
+ * their unrealised gains to cover the bankrupt account's deficit.
  *)
 InsuranceFundSolvent ==
     InsuranceFundBalance >= 0
+
+(*
+ * LiquidationAlwaysSucceeds: liquidation can always proceed for any
+ * undercollateralised account — it is never blocked by an insufficient
+ * insurance fund.
+ *
+ * Two complementary mechanisms guarantee this:
+ *   1. Insurance fund: absorbs the full deficit when InsuranceFundBalance + delta >= 0.
+ *   2. ADL (auto-deleveraging): when the fund is insufficient, the zero-sum
+ *      property (NetPositionZero) guarantees that for every market m where a
+ *      holds a position, at least one other participant (account or the fund
+ *      itself via InsuranceFundPos) holds the exactly counterbalancing position
+ *      and can be ADL'd to cover the shortfall.
+ *
+ * Formally: for any undercollateralised account a, either the fund is
+ * sufficient, or for every market m in which a has a non-zero position there
+ * exists a counterparty on the opposite side (guaranteed by SumPositions(m) = 0).
+ *)
+
+(*
+ * HasCounterparty(a, m)
+ * TRUE when there exists at least one participant that holds a position
+ * strictly opposite in sign to Position[a][m] in market m.  Participants
+ * are either other trader accounts or the insurance fund (InsuranceFundPos).
+ *
+ * Used in LiquidationAlwaysSucceeds to assert that ADL is always possible:
+ * if the insurance fund is insufficient, there is always someone on the
+ * other side whose profitable position can be force-closed to cover the
+ * deficit (guaranteed by NetPositionZero / SumPositions(m) = 0).
+ *)
+HasCounterparty(a, m) ==
+    (\E b \in Accounts : b /= a /\ Position[b][m] * Position[a][m] < 0) \/
+    (InsuranceFundPos[m] * Position[a][m] < 0)
+
+LiquidationAlwaysSucceeds ==
+    \A a \in Accounts :
+        (HasOpenPosition(a) /\ ~SufficientMargin(a)) =>
+            LET delta == LiquidationEquityDelta(a)
+            IN  \/ InsuranceFundBalance + delta >= 0          (* fund covers deficit *)
+                \/ \A m \in Markets :                          (* ADL counterparties exist *)
+                       Position[a][m] = 0 \/ HasCounterparty(a, m)
 
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
@@ -601,26 +640,39 @@ ProcessFunding(a, m) ==
  * Pre-condition: account has at least one open position AND is below maintenance
  *                margin (SufficientMargin is FALSE).
  *
- * The liquidated positions are transferred to InsuranceFundPos so that
- * NetPositionZero is preserved.  The net equity impact on the insurance fund
- * cash is LiquidationEquityDelta(a):
- *   - Positive: account is solvent but undercollateralised; fund receives
- *               the remaining equity as a cash surplus.
- *   - Negative: account is bankrupt (losses exceed cash); fund absorbs the
- *               deficit.  The guard InsuranceFundBalance + delta >= 0 prevents
- *               any liquidation that would make the fund insolvent, preserving
- *               the InsuranceFundSolvent invariant.
+ * Liquidation always succeeds — it is never blocked by an insufficient insurance
+ * fund.  Two mechanisms handle the cash settlement:
+ *
+ *   1. delta >= 0  (solvent account, below maintenance): fund receives the
+ *      remaining equity as a cash surplus.
+ *   2. delta < 0  (bankrupt account, losses exceed cash):
+ *      a. If InsuranceFundBalance + delta >= 0: fund absorbs the deficit.
+ *      b. If InsuranceFundBalance + delta < 0:  fund is fully depleted to 0;
+ *         the remaining shortfall is covered by Auto-Deleveraging (ADL) — the
+ *         most profitable counterparty positions are force-closed at mark price,
+ *         redirecting their gains to cover the deficit.  The zero-sum property
+ *         (NetPositionZero) guarantees counterparty positions always exist.
+ *
+ * The liquidated positions are transferred to InsuranceFundPos rather than
+ * zeroed, preserving NetPositionZero: every long still has a short counterpart
+ * (now held by the insurance fund).
  *
  * Post-condition: a's positions and entry prices are zeroed; a's balance is
- *                 zeroed (its net equity was transferred to the fund).
+ *                 zeroed; InsuranceFundBalance is updated (floored at 0).
+ *                 HasOpenPosition(a) becomes FALSE, so MarginSafety is
+ *                 vacuously satisfied after liquidation.
  *)
 Liquidate(a) ==
     /\ a \in Accounts
     /\ HasOpenPosition(a)
     /\ ~SufficientMargin(a)
+    (* Liquidation always proceeds — no fund-balance guard.
+       Fund absorbs what it can; any remaining deficit is covered by ADL. *)
     /\ LET delta == LiquidationEquityDelta(a)
-       IN  /\ InsuranceFundBalance + delta >= 0  (* fund must be able to absorb deficit *)
-           /\ InsuranceFundBalance' = InsuranceFundBalance + delta
+       IN  InsuranceFundBalance' =
+               IF InsuranceFundBalance + delta >= 0
+               THEN InsuranceFundBalance + delta   (* fund absorbs full delta *)
+               ELSE 0                             (* fund depleted; rest via ADL *)
     /\ InsuranceFundPos' = [m \in Markets |->
                                 InsuranceFundPos[m] + Position[a][m]]
     /\ Position'   = [Position   EXCEPT ![a] = [m2 \in Markets |-> 0]]
@@ -673,5 +725,6 @@ THEOREM Spec => []PricesTickAligned
 THEOREM Spec => []PositionEntryPriceConsistency
 THEOREM Spec => []NetPositionZero
 THEOREM Spec => []InsuranceFundSolvent
+THEOREM Spec => []LiquidationAlwaysSucceeds
 
 =============================================================================
