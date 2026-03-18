@@ -30,16 +30,18 @@ CONSTANTS
 (* ---------------------------------------------------------------------- *)
 
 VARIABLES
-    Balance,      (* Balance[a]       : collateral balance of account a    *)
-    Position,     (* Position[a][m]   : signed size of a's position in m   *)
-    EntryPrice,   (* EntryPrice[a][m] : average entry price of a's pos.    *)
-    MarkPrice,    (* MarkPrice[m]     : current mark price for market m     *)
-    OraclePrice,  (* OraclePrice[m]   : latest oracle price for market m   *)
-    FundingRate,  (* FundingRate[m]   : funding rate in -100..100 for market m *)
-    OrderBook     (* OrderBook[m]     : sequence of pending limit orders    *)
+    Balance,            (* Balance[a]         : collateral balance of account a    *)
+    Position,           (* Position[a][m]     : signed size (Int): >0 long, <0 short *)
+    EntryPrice,         (* EntryPrice[a][m]   : entry price of a's position in m   *)
+    MarkPrice,          (* MarkPrice[m]        : current mark price for market m     *)
+    OraclePrice,        (* OraclePrice[m]      : latest oracle price for market m   *)
+    FundingRate,        (* FundingRate[m]      : funding rate in -100..100           *)
+    OrderBook,          (* OrderBook[m]        : sequence of pending limit orders    *)
+    InsuranceFundPos    (* InsuranceFundPos[m] : insurance fund's net position in m;
+                           absorbs liquidated positions to preserve NetPositionZero  *)
 
 vars == <<Balance, Position, EntryPrice, MarkPrice,
-          OraclePrice, FundingRate, OrderBook>>
+          OraclePrice, FundingRate, OrderBook, InsuranceFundPos>>
 
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
@@ -58,34 +60,37 @@ Order == [account : Accounts, side : {1, -1}, size : Nat \ {0}, price : Nat \ {0
 (* ---------------------------------------------------------------------- *)
 
 (*
- * Unrealised profit-and-loss for account a in market m.
- * PnL is positive when the position is profitable.
- *   Long  (pos > 0): PnL = size  * (mark - entry)
- *   Short (pos < 0): PnL = (-size) * (entry - mark)
- * We model signed positions as a pair Position[a][m] \in Int, represented
- * here with Naturals by keeping separate "long" and "short" magnitudes.
- * For simplicity in this spec every position is either zero, positive
- * (long) or negative (short); we encode negative sizes by requiring
- * Position[a][m] \in Int.  Because TLC works on Nat we use the convention:
- *   Position[a][m] > 0  => long
- *   Position[a][m] = 0  => flat
- * and handle shorts through the "side" field of an order.
+ * Unrealised profit-and-loss helpers.
  *
- * Here we compute an *unsigned* PnL magnitude and direction separately so
- * that all arithmetic stays in Nat.
+ * Positions are signed integers:
+ *   Position[a][m] > 0  => long  (profits when mark rises above entry)
+ *   Position[a][m] < 0  => short (profits when mark falls below entry)
+ *   Position[a][m] = 0  => flat
+ *
+ * AbsPnL returns the non-negative magnitude of the unrealised PnL,
+ * regardless of direction.  PnLPositive tells us whether the position
+ * is currently in profit (TRUE) or at a loss (FALSE).
+ * Both helpers stay in Nat so that downstream arithmetic is simpler.
  *)
 
 AbsPnL(a, m) ==
-    LET size  == Position[a][m]
-        entry == EntryPrice[a][m]
-        mark  == MarkPrice[m]
+    LET pos   == Position[a][m]
+        absPos == IF pos >= 0 THEN pos ELSE -pos
+        entry  == EntryPrice[a][m]
+        mark   == MarkPrice[m]
     IN  IF mark >= entry
-        THEN size * (mark - entry)
-        ELSE size * (entry - mark)
+        THEN absPos * (mark - entry)
+        ELSE absPos * (entry - mark)
 
 PnLPositive(a, m) ==
-    (* TRUE when the unrealised PnL is non-negative for account a in m *)
-    MarkPrice[m] >= EntryPrice[a][m]
+    (* TRUE when the unrealised PnL is non-negative for account a in m.
+       Long  profits when mark >= entry.
+       Short profits when mark <= entry.
+       Flat accounts are counted as break-even (TRUE) to contribute 0. *)
+    LET pos == Position[a][m]
+    IN  \/ (pos > 0 /\ MarkPrice[m] >= EntryPrice[a][m])
+        \/ (pos < 0 /\ MarkPrice[m] <= EntryPrice[a][m])
+        \/ pos = 0
 
 (*
  * Effective equity = cash balance + sum over markets of signed PnL.
@@ -119,22 +124,33 @@ SufficientMargin(a) ==
  * balance.
  *)
 HasOpenPosition(a) ==
-    \E m \in Markets : Position[a][m] > 0
+    (* TRUE when account a has any non-zero position (long OR short) *)
+    \E m \in Markets : Position[a][m] /= 0
 
 (*
  * AccountSafeAtMarkPrice(a, m, mark)
- * Check that account a (which is assumed to hold a long position in m, i.e.
- * Position[a][m] > 0) would remain above MaintenanceMargin if market m's
- * mark price were set to `mark`.  Only valid for long (non-negative) positions;
- * short modelling is out of scope for this spec.  Used as a pre-condition in
- * PriceUpdate to preserve MarginSafety across price changes.
+ * Check that account a's total equity would remain above MaintenanceMargin
+ * if market m's mark price were set to `mark`.  Handles both long and short
+ * positions.  Used as a pre-condition in PriceUpdate to preserve MarginSafety
+ * across price changes.
+ * Other-market PnL is computed by removing the current market-m contribution
+ * from the aggregate sums and replacing it with the hypothetical new-mark PnL.
  *)
 AccountSafeAtMarkPrice(a, m, mark) ==
-    LET absPos == Position[a][m]
-        entry  == EntryPrice[a][m]
-        gain   == IF mark >= entry THEN absPos * (mark - entry) ELSE 0
-        loss   == IF mark < entry  THEN absPos * (entry - mark) ELSE 0
-    IN  Balance[a] + gain >= loss + MaintenanceMargin
+    LET pos         == Position[a][m]
+        absPos      == IF pos >= 0 THEN pos ELSE -pos
+        entry       == EntryPrice[a][m]
+        (* PnL from market m at the candidate mark price *)
+        gain        == IF pos > 0 /\ mark >= entry THEN absPos * (mark - entry)
+                       ELSE IF pos < 0 /\ entry >= mark THEN absPos * (entry - mark)
+                       ELSE 0
+        loss        == IF pos > 0 /\ entry > mark THEN absPos * (entry - mark)
+                       ELSE IF pos < 0 /\ mark > entry THEN absPos * (mark - entry)
+                       ELSE 0
+        (* PnL from all other markets at their current mark prices *)
+        otherGains  == PositivePnLSum(a) - (IF PnLPositive(a, m) THEN AbsPnL(a, m) ELSE 0)
+        otherLosses == NegativePnLSum(a) - (IF ~PnLPositive(a, m) THEN AbsPnL(a, m) ELSE 0)
+    IN  Balance[a] + gain + otherGains >= loss + otherLosses + MaintenanceMargin
 
 (*
  * SufficientMarginAfterDebit(a, amount)
@@ -180,16 +196,25 @@ BestSellIdx(m) ==
 (*
  * PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize)
  * TRUE when the buyer's total equity (across all markets) remains above
- * MaintenanceMargin after the trade.  The trade changes Balance and the
- * position in market m; all other-market positions are untouched, so their
- * PnL contribution is computed by subtracting out the pre-trade market-m
- * contribution from the aggregate sums.
+ * MaintenanceMargin after the trade.  The buyer's position in m changes by
+ * +tradeSize (can go from short → flat → long); entry is set to tradePrice
+ * for any non-zero resulting position.  Other-market PnL is unchanged.
  *)
 PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize) ==
     LET newBal      == Balance[buyer] - InitialMargin
         newPos      == Position[buyer][m] + tradeSize
-        newGainM    == IF MarkPrice[m] >= tradePrice THEN newPos * (MarkPrice[m] - tradePrice) ELSE 0
-        newLossM    == IF MarkPrice[m] <  tradePrice THEN newPos * (tradePrice - MarkPrice[m]) ELSE 0
+        absNew      == IF newPos >= 0 THEN newPos ELSE -newPos
+        (* PnL at new position; entry price will be tradePrice if newPos /= 0 *)
+        newGainM    == IF newPos > 0 /\ MarkPrice[m] >= tradePrice
+                       THEN absNew * (MarkPrice[m] - tradePrice)
+                       ELSE IF newPos < 0 /\ tradePrice >= MarkPrice[m]
+                       THEN absNew * (tradePrice - MarkPrice[m])
+                       ELSE 0
+        newLossM    == IF newPos > 0 /\ tradePrice > MarkPrice[m]
+                       THEN absNew * (tradePrice - MarkPrice[m])
+                       ELSE IF newPos < 0 /\ MarkPrice[m] > tradePrice
+                       THEN absNew * (MarkPrice[m] - tradePrice)
+                       ELSE 0
         oldGainM    == IF PnLPositive(buyer, m) THEN AbsPnL(buyer, m) ELSE 0
         oldLossM    == IF ~PnLPositive(buyer, m) THEN AbsPnL(buyer, m) ELSE 0
         otherGains  == PositivePnLSum(buyer) - oldGainM
@@ -197,24 +222,46 @@ PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize) ==
     IN  newBal + newGainM + otherGains >= newLossM + otherLosses + MaintenanceMargin
 
 (*
- * PostTradeSellerSafe(seller, m, tradeSize)
+ * PostTradeSellerSafe(seller, m, tradePrice, tradeSize)
  * TRUE when the seller's total equity (across all markets) remains above
- * MaintenanceMargin after the trade.  Entry price is preserved on partial
- * exits and cleared on full close.  Other-market PnL is unchanged.
+ * MaintenanceMargin after the trade.  The seller's position in m changes by
+ * -tradeSize (can go from long → flat → short); entry is set to tradePrice
+ * for any non-zero resulting position.  Other-market PnL is unchanged.
  *)
-PostTradeSellerSafe(seller, m, tradeSize) ==
+PostTradeSellerSafe(seller, m, tradePrice, tradeSize) ==
     LET newBal      == Balance[seller] - InitialMargin
         newPos      == Position[seller][m] - tradeSize
-        newEntry    == IF newPos = 0 THEN 0 ELSE EntryPrice[seller][m]
-        newGainM    == IF newPos > 0 /\ MarkPrice[m] >= newEntry
-                       THEN newPos * (MarkPrice[m] - newEntry) ELSE 0
-        newLossM    == IF newPos > 0 /\ MarkPrice[m] <  newEntry
-                       THEN newPos * (newEntry - MarkPrice[m]) ELSE 0
+        absNew      == IF newPos >= 0 THEN newPos ELSE -newPos
+        (* PnL at new position; entry price will be tradePrice if newPos /= 0 *)
+        newGainM    == IF newPos > 0 /\ MarkPrice[m] >= tradePrice
+                       THEN absNew * (MarkPrice[m] - tradePrice)
+                       ELSE IF newPos < 0 /\ tradePrice >= MarkPrice[m]
+                       THEN absNew * (tradePrice - MarkPrice[m])
+                       ELSE 0
+        newLossM    == IF newPos > 0 /\ tradePrice > MarkPrice[m]
+                       THEN absNew * (tradePrice - MarkPrice[m])
+                       ELSE IF newPos < 0 /\ MarkPrice[m] > tradePrice
+                       THEN absNew * (MarkPrice[m] - tradePrice)
+                       ELSE 0
         oldGainM    == IF PnLPositive(seller, m) THEN AbsPnL(seller, m) ELSE 0
         oldLossM    == IF ~PnLPositive(seller, m) THEN AbsPnL(seller, m) ELSE 0
         otherGains  == PositivePnLSum(seller) - oldGainM
         otherLosses == NegativePnLSum(seller) - oldLossM
     IN  newBal + newGainM + otherGains >= newLossM + otherLosses + MaintenanceMargin
+
+(*
+ * SumPositions(m)
+ * The net open interest in market m: sum of all account positions plus the
+ * insurance fund's net position.  This is 0 if and only if every long has
+ * an exact short counterpart (possibly held by the insurance fund after
+ * a liquidation).
+ *)
+SumPositions(m) ==
+    LET helper[S \in SUBSET Accounts] ==
+            IF S = {} THEN 0
+            ELSE LET a == CHOOSE x \in S : TRUE
+                 IN  Position[a][m] + helper[S \ {a}]
+    IN  helper[Accounts] + InsuranceFundPos[m]
 
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
@@ -222,12 +269,13 @@ PostTradeSellerSafe(seller, m, tradeSize) ==
 (* ---------------------------------------------------------------------- *)
 
 TypeInvariant ==
-    /\ Balance    \in [Accounts -> Nat]
-    /\ Position   \in [Accounts -> [Markets -> Nat]]
-    /\ EntryPrice \in [Accounts -> [Markets -> Nat]]
-    /\ MarkPrice  \in [Markets -> Nat]
-    /\ OraclePrice \in [Markets -> Nat]
-    /\ FundingRate \in [Markets -> -100..100]
+    /\ Balance         \in [Accounts -> Nat]
+    /\ Position        \in [Accounts -> [Markets -> Int]]
+    /\ EntryPrice      \in [Accounts -> [Markets -> Nat]]
+    /\ MarkPrice       \in [Markets -> Nat]
+    /\ OraclePrice     \in [Markets -> Nat]
+    /\ FundingRate     \in [Markets -> -100..100]
+    /\ InsuranceFundPos \in [Markets -> Int]
     /\ \A m \in Markets :
            \A i \in DOMAIN OrderBook[m] :
                OrderBook[m][i] \in Order
@@ -267,6 +315,18 @@ PositionEntryPriceConsistency ==
     \A a \in Accounts, m \in Markets :
         (Position[a][m] = 0) <=> (EntryPrice[a][m] = 0)
 
+(*
+ * NetPositionZero: the net open interest in every market is zero — every
+ * long has an exact short counterpart.  When a trader is liquidated their
+ * position is transferred to the insurance fund (InsuranceFundPos), so the
+ * zero-sum identity is maintained even through liquidations.
+ *
+ * This is the fundamental accounting identity of a derivatives exchange:
+ *   \sum_{a \in Accounts} Position[a][m]  +  InsuranceFundPos[m]  =  0
+ *)
+NetPositionZero ==
+    \A m \in Markets : SumPositions(m) = 0
+
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
 (*  S T A T E   C O N S T R A I N T   ( f o r   T L C )                  *)
@@ -279,7 +339,10 @@ PositionEntryPriceConsistency ==
  *)
 StateConstraint ==
     /\ \A a \in Accounts : Balance[a] <= MaxBalance
-    /\ \A a \in Accounts, m \in Markets : Position[a][m] <= MaxBalance
+    /\ \A a \in Accounts, m \in Markets :
+           -MaxBalance <= Position[a][m] /\ Position[a][m] <= MaxBalance
+    /\ \A m \in Markets :
+           -MaxBalance <= InsuranceFundPos[m] /\ InsuranceFundPos[m] <= MaxBalance
     /\ \A m \in Markets : Len(OrderBook[m]) <= 2
 
 -----------------------------------------------------------------------------
@@ -288,13 +351,14 @@ StateConstraint ==
 (* ---------------------------------------------------------------------- *)
 
 Init ==
-    /\ Balance     = [a \in Accounts |-> 0]
-    /\ Position    = [a \in Accounts |-> [m \in Markets |-> 0]]
-    /\ EntryPrice  = [a \in Accounts |-> [m \in Markets |-> 0]]
-    /\ MarkPrice   = [m \in Markets |-> TickSize]
-    /\ OraclePrice = [m \in Markets |-> TickSize]
-    /\ FundingRate = [m \in Markets |-> 0]
-    /\ OrderBook   = [m \in Markets |-> << >>]
+    /\ Balance          = [a \in Accounts |-> 0]
+    /\ Position         = [a \in Accounts |-> [m \in Markets |-> 0]]
+    /\ EntryPrice       = [a \in Accounts |-> [m \in Markets |-> 0]]
+    /\ MarkPrice        = [m \in Markets |-> TickSize]
+    /\ OraclePrice      = [m \in Markets |-> TickSize]
+    /\ FundingRate      = [m \in Markets |-> 0]
+    /\ OrderBook        = [m \in Markets |-> << >>]
+    /\ InsuranceFundPos = [m \in Markets |-> 0]
 
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
@@ -312,7 +376,7 @@ Deposit(a, amount) ==
     /\ amount > 0
     /\ Balance'    = [Balance    EXCEPT ![a] = @ + amount]
     /\ UNCHANGED <<Position, EntryPrice, MarkPrice, OraclePrice,
-                   FundingRate, OrderBook>>
+                   FundingRate, OrderBook, InsuranceFundPos>>
 
 (*
  * Withdraw(a, amount)
@@ -331,7 +395,7 @@ Withdraw(a, amount) ==
                    >= NegativePnLSum(a) + MaintenanceMargin)
            /\ Balance' = newBalance
     /\ UNCHANGED <<Position, EntryPrice, MarkPrice, OraclePrice,
-                   FundingRate, OrderBook>>
+                   FundingRate, OrderBook, InsuranceFundPos>>
 
 (*
  * PlaceOrder(a, m, side, size, price)
@@ -352,7 +416,7 @@ PlaceOrder(a, m, side, size, price) ==
     /\ LET o == [account |-> a, side |-> side, size |-> size, price |-> price]
        IN  OrderBook' = [OrderBook EXCEPT ![m] = Append(@, o)]
     /\ UNCHANGED <<Balance, Position, EntryPrice, MarkPrice,
-                   OraclePrice, FundingRate>>
+                   OraclePrice, FundingRate, InsuranceFundPos>>
 
 (*
  * ExecuteTrade(m)
@@ -367,13 +431,13 @@ PlaceOrder(a, m, side, size, price) ==
  * differ.  Self-trading (buyer = seller) is prohibited.
  *
  * Post-conditions:
- *   - Buyer's position increases by tradeSize; entry price set to tradePrice.
- *   - Seller's position decreases by tradeSize; entry price preserved on
- *     partial exits and cleared to 0 on a full close.
+ *   - Buyer's position changes by +tradeSize (can go short → flat → long).
+ *   - Seller's position changes by -tradeSize (can go long → flat → short).
+ *   - Entry price is set to tradePrice for any non-zero resulting position,
+ *     or cleared to 0 when the position closes exactly to zero.
  *   - Both parties pay InitialMargin from their balance.
- *   - The fully-consumed order is removed; the residual (if any) stays in the
- *     book with its size reduced.  Order-book positions of surviving orders
- *     are preserved; the partial residual is appended at the tail.
+ *   - The fully-consumed order is removed; any partial residual is appended
+ *     back with its size reduced.
  *   - Post-trade equity of each party must satisfy MaintenanceMargin.
  *)
 ExecuteTrade(m) ==
@@ -384,46 +448,46 @@ ExecuteTrade(m) ==
            /\ i > 0
            /\ j > 0
            /\ OrderBook[m][i].price >= OrderBook[m][j].price
-           /\ LET buyOrder   == OrderBook[m][i]
-                  sellOrder  == OrderBook[m][j]
-                  tradePrice == sellOrder.price
-                  tradeSize  == Min(buyOrder.size, sellOrder.size)
-                  buyer      == buyOrder.account
-                  seller     == sellOrder.account
-                  lo         == IF i < j THEN i ELSE j
-                  hi         == IF i < j THEN j ELSE i
+           /\ LET buyOrder      == OrderBook[m][i]
+                  sellOrder     == OrderBook[m][j]
+                  tradePrice    == sellOrder.price
+                  tradeSize     == Min(buyOrder.size, sellOrder.size)
+                  buyer         == buyOrder.account
+                  seller        == sellOrder.account
+                  newBuyerPos   == Position[buyer][m]  + tradeSize
+                  newSellerPos  == Position[seller][m] - tradeSize
+                  lo            == IF i < j THEN i ELSE j
+                  hi            == IF i < j THEN j ELSE i
                   (* Remove both matched orders; re-add any partial residual. *)
-                  base       == SubSeq(OrderBook[m], 1, lo - 1)
-                                \o SubSeq(OrderBook[m], lo + 1, hi - 1)
-                                \o SubSeq(OrderBook[m], hi + 1, Len(OrderBook[m]))
-                  newBook    ==
+                  base          == SubSeq(OrderBook[m], 1, lo - 1)
+                                   \o SubSeq(OrderBook[m], lo + 1, hi - 1)
+                                   \o SubSeq(OrderBook[m], hi + 1, Len(OrderBook[m]))
+                  newBook       ==
                       IF    buyOrder.size < sellOrder.size
                       THEN  Append(base, [sellOrder EXCEPT !.size = @ - tradeSize])
                       ELSE IF buyOrder.size > sellOrder.size
                       THEN  Append(base, [buyOrder  EXCEPT !.size = @ - tradeSize])
                       ELSE  base  (* both orders fully consumed *)
-              IN
+               IN
                   /\ buyer /= seller
                   /\ Balance[buyer]  >= InitialMargin
                   /\ Balance[seller] >= InitialMargin
-                  /\ Position[seller][m] >= tradeSize
+                  (* No seller position pre-condition: seller opens a new short if flat *)
                   /\ PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize)
-                  /\ PostTradeSellerSafe(seller, m, tradeSize)
+                  /\ PostTradeSellerSafe(seller, m, tradePrice, tradeSize)
                   /\ Balance' = [Balance EXCEPT
                          ![buyer]  = @ - InitialMargin,
                          ![seller] = @ - InitialMargin]
                   /\ Position' = [Position EXCEPT
-                         ![buyer][m]  = @ + tradeSize,
-                         ![seller][m] = @ - tradeSize]
+                         ![buyer][m]  = newBuyerPos,
+                         ![seller][m] = newSellerPos]
                   /\ EntryPrice' = [EntryPrice EXCEPT
-                         ![buyer][m]  = tradePrice,
-                         (* Seller: preserve entry price on partial exit,
-                            clear to 0 when the position is fully closed. *)
-                         ![seller][m] = IF Position[seller][m] - tradeSize = 0
-                                        THEN 0
-                                        ELSE EntryPrice[seller][m]]
+                         (* Entry price is tradePrice for any open position,
+                            or 0 when the position exactly closes to zero. *)
+                         ![buyer][m]  = IF newBuyerPos  = 0 THEN 0 ELSE tradePrice,
+                         ![seller][m] = IF newSellerPos = 0 THEN 0 ELSE tradePrice]
                   /\ OrderBook' = [OrderBook EXCEPT ![m] = newBook]
-    /\ UNCHANGED <<MarkPrice, OraclePrice, FundingRate>>
+    /\ UNCHANGED <<MarkPrice, OraclePrice, FundingRate, InsuranceFundPos>>
 
 (*
  * PriceUpdate(m, newMark, newOracle)
@@ -440,12 +504,13 @@ PriceUpdate(m, newMark, newOracle) ==
     /\ newOracle <= MaxPrice
     /\ newMark   % TickSize = 0
     /\ newOracle % TickSize = 0
-    (* Safety pre-check: all accounts with positions remain above maintenance margin *)
+    (* Safety pre-check: all accounts with any position remain above maintenance margin *)
     /\ \A a \in Accounts :
-           Position[a][m] > 0 => AccountSafeAtMarkPrice(a, m, newMark)
+           Position[a][m] /= 0 => AccountSafeAtMarkPrice(a, m, newMark)
     /\ MarkPrice'   = [MarkPrice   EXCEPT ![m] = newMark]
     /\ OraclePrice' = [OraclePrice EXCEPT ![m] = newOracle]
-    /\ UNCHANGED <<Balance, Position, EntryPrice, FundingRate, OrderBook>>
+    /\ UNCHANGED <<Balance, Position, EntryPrice, FundingRate, OrderBook,
+                   InsuranceFundPos>>
 
 (*
  * UpdateFundingRate(m, rate)
@@ -456,48 +521,63 @@ UpdateFundingRate(m, rate) ==
     /\ m \in Markets
     /\ FundingRate' = [FundingRate EXCEPT ![m] = rate]
     /\ UNCHANGED <<Balance, Position, EntryPrice, MarkPrice,
-                   OraclePrice, OrderBook>>
+                   OraclePrice, OrderBook, InsuranceFundPos>>
 
 (*
  * ProcessFunding(a, m)
  * Apply the current funding payment for account a's position in market m.
- * Long positions pay funding when rate > 0; short positions pay when rate < 0.
- * For this spec we only model long positions (Position >= 0) and apply the
- * payment as: payment = Position[a][m] * |FundingRate[m]|.
- * If the account owes funding, deduct from Balance; if owed, add to Balance.
- * Pre-condition: account has a non-zero position in the market, and when
- *                paying, the remaining equity must still satisfy MarginSafety.
+ * Funding transfers wealth from one side to the other:
+ *   Rate >= 0: longs pay, shorts receive  (mark >= oracle → market is rich)
+ *   Rate <  0: shorts pay, longs receive  (mark < oracle → market is cheap)
+ * Payment = |Position| * |FundingRate|.
+ * When the account owes funding its post-payment equity must still satisfy
+ * MaintenanceMargin; when it receives funding its balance only increases.
  *)
 ProcessFunding(a, m) ==
     /\ a \in Accounts
     /\ m \in Markets
-    /\ Position[a][m] > 0
-    /\ LET rate    == FundingRate[m]
-           size    == Position[a][m]
-           payment == size * (IF rate >= 0 THEN rate ELSE -rate)
-       IN  IF rate >= 0
-           THEN (* longs pay; ensure post-payment equity stays above maintenance margin *)
-                /\ SufficientMarginAfterDebit(a, payment)
-                /\ Balance' = [Balance EXCEPT ![a] = @ - payment]
-           ELSE (* longs receive; balance only increases, always safe *)
-                /\ Balance' = [Balance EXCEPT ![a] = @ + payment]
+    /\ Position[a][m] /= 0
+    /\ LET pos     == Position[a][m]
+           absPos  == IF pos >= 0 THEN pos ELSE -pos
+           rate    == FundingRate[m]
+           absRate == IF rate >= 0 THEN rate ELSE -rate
+           payment == absPos * absRate
+           (* Long pays when rate >= 0; short pays when rate < 0 *)
+           paying  == (pos > 0 /\ rate >= 0) \/ (pos < 0 /\ rate < 0)
+       IN  /\ rate /= 0    (* skip no-op when funding rate is zero *)
+           /\ payment > 0  (* also skip if somehow position is zero (redundant safety) *)
+           /\ IF paying
+              THEN (* payer: balance must stay non-negative; check post-payment margin *)
+                   /\ Balance[a] >= payment
+                   /\ SufficientMarginAfterDebit(a, payment)
+                   /\ Balance' = [Balance EXCEPT ![a] = @ - payment]
+              ELSE (* receiver: balance only increases, always safe *)
+                   /\ Balance' = [Balance EXCEPT ![a] = @ + payment]
     /\ UNCHANGED <<Position, EntryPrice, MarkPrice, OraclePrice,
-                   FundingRate, OrderBook>>
+                   FundingRate, OrderBook, InsuranceFundPos>>
 
 (*
- * Liquidate(a, m)
- * Force-close ALL of account a's positions when margin is insufficient.
- * Pre-condition: account has an open position AND is below maintenance margin.
- * Post-condition: all positions are zeroed; balance is set to 0 (insurance fund
- *                 absorbs any deficit in a real system; simplified here).
- *                 Closing all positions ensures HasOpenPosition becomes FALSE,
- *                 so MarginSafety is vacuously satisfied after liquidation.
+ * Liquidate(a)
+ * Force-close ALL of account a's positions when its margin is insufficient.
+ * Pre-condition: account has at least one open position AND is below maintenance
+ *                margin (SufficientMargin is FALSE).
+ *
+ * The liquidated positions are transferred to InsuranceFundPos rather than
+ * simply zeroed, so that NetPositionZero is preserved: every long still has
+ * a corresponding short (now held by the insurance fund).
+ *
+ * Post-condition: all of a's positions and entry prices are zeroed; balance
+ *                 is set to 0 (insurance fund absorbs any deficit).
+ *                 HasOpenPosition(a) becomes FALSE, so MarginSafety is
+ *                 vacuously satisfied after liquidation.
  *)
-Liquidate(a, m) ==
+Liquidate(a) ==
     /\ a \in Accounts
-    /\ m \in Markets
-    /\ Position[a][m] > 0
+    /\ HasOpenPosition(a)
     /\ ~SufficientMargin(a)
+    (* Transfer all positions to the insurance fund, preserving NetPositionZero *)
+    /\ InsuranceFundPos' = [m \in Markets |->
+                                InsuranceFundPos[m] + Position[a][m]]
     /\ Position'   = [Position   EXCEPT ![a] = [m2 \in Markets |-> 0]]
     /\ EntryPrice' = [EntryPrice EXCEPT ![a] = [m2 \in Markets |-> 0]]
     /\ Balance'    = [Balance    EXCEPT ![a] = 0]
@@ -523,8 +603,7 @@ Next ==
            UpdateFundingRate(m, r)
     \/ \E a \in Accounts, m \in Markets :
            ProcessFunding(a, m)
-    \/ \E a \in Accounts, m \in Markets :
-           Liquidate(a, m)
+    \/ \E a \in Accounts : Liquidate(a)
 
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
@@ -547,5 +626,6 @@ THEOREM Spec => []MarginSafety
 THEOREM Spec => []MarkPricesPositive
 THEOREM Spec => []PricesTickAligned
 THEOREM Spec => []PositionEntryPriceConsistency
+THEOREM Spec => []NetPositionZero
 
 =============================================================================
