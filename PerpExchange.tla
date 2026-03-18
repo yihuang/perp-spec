@@ -30,18 +30,22 @@ CONSTANTS
 (* ---------------------------------------------------------------------- *)
 
 VARIABLES
-    Balance,            (* Balance[a]         : collateral balance of account a    *)
-    Position,           (* Position[a][m]     : signed size (Int): >0 long, <0 short *)
-    EntryPrice,         (* EntryPrice[a][m]   : entry price of a's position in m   *)
-    MarkPrice,          (* MarkPrice[m]        : current mark price for market m     *)
-    OraclePrice,        (* OraclePrice[m]      : latest oracle price for market m   *)
-    FundingRate,        (* FundingRate[m]      : funding rate in -100..100           *)
-    OrderBook,          (* OrderBook[m]        : sequence of pending limit orders    *)
-    InsuranceFundPos    (* InsuranceFundPos[m] : insurance fund's net position in m;
-                           absorbs liquidated positions to preserve NetPositionZero  *)
+    Balance,                (* Balance[a]             : collateral balance of account a    *)
+    Position,               (* Position[a][m]         : signed size (Int): >0 long, <0 short *)
+    EntryPrice,             (* EntryPrice[a][m]       : entry price of a's position in m   *)
+    MarkPrice,              (* MarkPrice[m]            : current mark price for market m     *)
+    OraclePrice,            (* OraclePrice[m]          : latest oracle price for market m   *)
+    FundingRate,            (* FundingRate[m]          : funding rate in -100..100           *)
+    OrderBook,              (* OrderBook[m]            : sequence of pending limit orders    *)
+    InsuranceFundPos,       (* InsuranceFundPos[m]     : insurance fund's net position in m;
+                               absorbs liquidated positions to preserve NetPositionZero     *)
+    InsuranceFundBalance    (* InsuranceFundBalance    : cash reserves of the insurance fund;
+                               receives collateral from liquidated accounts and absorbs any
+                               bankruptcy deficit; invariant: InsuranceFundBalance >= 0     *)
 
 vars == <<Balance, Position, EntryPrice, MarkPrice,
-          OraclePrice, FundingRate, OrderBook, InsuranceFundPos>>
+          OraclePrice, FundingRate, OrderBook,
+          InsuranceFundPos, InsuranceFundBalance>>
 
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
@@ -263,19 +267,38 @@ SumPositions(m) ==
                  IN  Position[a][m] + helper[S \ {a}]
     IN  helper[Accounts] + InsuranceFundPos[m]
 
+(*
+ * LiquidationEquityDelta(a)
+ * The net cash impact on the insurance fund when account a is liquidated.
+ *   equity = Balance[a] + PositivePnLSum(a) - NegativePnLSum(a)
+ *
+ * If equity >= 0 (solvent but below maintenance margin):
+ *   Fund receives the full equity as cash surplus.
+ * If equity < 0 (bankrupt: unrealised losses exceed the cash balance):
+ *   Fund receives Balance[a] in cash but "pays" the shortfall; the net
+ *   impact on the fund's cash reserves is exactly `equity` (a negative
+ *   number equal to -(shortfall)).
+ *
+ * Used both as the cash update in Liquidate and in the guard that prevents
+ * liquidation when the fund cannot absorb the deficit.
+ *)
+LiquidationEquityDelta(a) ==
+    Balance[a] + PositivePnLSum(a) - NegativePnLSum(a)
+
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
 (*  I N V A R I A N T S                                                    *)
 (* ---------------------------------------------------------------------- *)
 
 TypeInvariant ==
-    /\ Balance         \in [Accounts -> Nat]
-    /\ Position        \in [Accounts -> [Markets -> Int]]
-    /\ EntryPrice      \in [Accounts -> [Markets -> Nat]]
-    /\ MarkPrice       \in [Markets -> Nat]
-    /\ OraclePrice     \in [Markets -> Nat]
-    /\ FundingRate     \in [Markets -> -100..100]
-    /\ InsuranceFundPos \in [Markets -> Int]
+    /\ Balance              \in [Accounts -> Nat]
+    /\ Position             \in [Accounts -> [Markets -> Int]]
+    /\ EntryPrice           \in [Accounts -> [Markets -> Nat]]
+    /\ MarkPrice            \in [Markets -> Nat]
+    /\ OraclePrice          \in [Markets -> Nat]
+    /\ FundingRate          \in [Markets -> -100..100]
+    /\ InsuranceFundPos     \in [Markets -> Int]
+    /\ InsuranceFundBalance \in Int
     /\ \A m \in Markets :
            \A i \in DOMAIN OrderBook[m] :
                OrderBook[m][i] \in Order
@@ -327,6 +350,20 @@ PositionEntryPriceConsistency ==
 NetPositionZero ==
     \A m \in Markets : SumPositions(m) = 0
 
+(*
+ * InsuranceFundSolvent: the insurance fund's cash reserves are always
+ * non-negative.  The fund receives the net equity of each liquidated
+ * account (LiquidationEquityDelta).  When an account is bankrupt its equity
+ * is negative, so the fund absorbs the shortfall; the guard in Liquidate
+ * prevents any liquidation that would drive the fund below zero.
+ *
+ * This invariant captures the real-world requirement that the insurance fund
+ * must not become insolvent.  A depleted fund means the exchange cannot
+ * safely liquidate further undercollateralised positions.
+ *)
+InsuranceFundSolvent ==
+    InsuranceFundBalance >= 0
+
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
 (*  S T A T E   C O N S T R A I N T   ( f o r   T L C )                  *)
@@ -343,6 +380,7 @@ StateConstraint ==
            -MaxBalance <= Position[a][m] /\ Position[a][m] <= MaxBalance
     /\ \A m \in Markets :
            -MaxBalance <= InsuranceFundPos[m] /\ InsuranceFundPos[m] <= MaxBalance
+    /\ -MaxBalance <= InsuranceFundBalance /\ InsuranceFundBalance <= MaxBalance
     /\ \A m \in Markets : Len(OrderBook[m]) <= 2
 
 -----------------------------------------------------------------------------
@@ -351,14 +389,15 @@ StateConstraint ==
 (* ---------------------------------------------------------------------- *)
 
 Init ==
-    /\ Balance          = [a \in Accounts |-> 0]
-    /\ Position         = [a \in Accounts |-> [m \in Markets |-> 0]]
-    /\ EntryPrice       = [a \in Accounts |-> [m \in Markets |-> 0]]
-    /\ MarkPrice        = [m \in Markets |-> TickSize]
-    /\ OraclePrice      = [m \in Markets |-> TickSize]
-    /\ FundingRate      = [m \in Markets |-> 0]
-    /\ OrderBook        = [m \in Markets |-> << >>]
-    /\ InsuranceFundPos = [m \in Markets |-> 0]
+    /\ Balance              = [a \in Accounts |-> 0]
+    /\ Position             = [a \in Accounts |-> [m \in Markets |-> 0]]
+    /\ EntryPrice           = [a \in Accounts |-> [m \in Markets |-> 0]]
+    /\ MarkPrice            = [m \in Markets |-> TickSize]
+    /\ OraclePrice          = [m \in Markets |-> TickSize]
+    /\ FundingRate          = [m \in Markets |-> 0]
+    /\ OrderBook            = [m \in Markets |-> << >>]
+    /\ InsuranceFundPos     = [m \in Markets |-> 0]
+    /\ InsuranceFundBalance = 0
 
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
@@ -376,7 +415,7 @@ Deposit(a, amount) ==
     /\ amount > 0
     /\ Balance'    = [Balance    EXCEPT ![a] = @ + amount]
     /\ UNCHANGED <<Position, EntryPrice, MarkPrice, OraclePrice,
-                   FundingRate, OrderBook, InsuranceFundPos>>
+                   FundingRate, OrderBook, InsuranceFundPos, InsuranceFundBalance>>
 
 (*
  * Withdraw(a, amount)
@@ -395,7 +434,7 @@ Withdraw(a, amount) ==
                    >= NegativePnLSum(a) + MaintenanceMargin)
            /\ Balance' = newBalance
     /\ UNCHANGED <<Position, EntryPrice, MarkPrice, OraclePrice,
-                   FundingRate, OrderBook, InsuranceFundPos>>
+                   FundingRate, OrderBook, InsuranceFundPos, InsuranceFundBalance>>
 
 (*
  * PlaceOrder(a, m, side, size, price)
@@ -416,7 +455,7 @@ PlaceOrder(a, m, side, size, price) ==
     /\ LET o == [account |-> a, side |-> side, size |-> size, price |-> price]
        IN  OrderBook' = [OrderBook EXCEPT ![m] = Append(@, o)]
     /\ UNCHANGED <<Balance, Position, EntryPrice, MarkPrice,
-                   OraclePrice, FundingRate, InsuranceFundPos>>
+                   OraclePrice, FundingRate, InsuranceFundPos, InsuranceFundBalance>>
 
 (*
  * ExecuteTrade(m)
@@ -487,7 +526,7 @@ ExecuteTrade(m) ==
                          ![buyer][m]  = IF newBuyerPos  = 0 THEN 0 ELSE tradePrice,
                          ![seller][m] = IF newSellerPos = 0 THEN 0 ELSE tradePrice]
                   /\ OrderBook' = [OrderBook EXCEPT ![m] = newBook]
-    /\ UNCHANGED <<MarkPrice, OraclePrice, FundingRate, InsuranceFundPos>>
+    /\ UNCHANGED <<MarkPrice, OraclePrice, FundingRate, InsuranceFundPos, InsuranceFundBalance>>
 
 (*
  * PriceUpdate(m, newMark, newOracle)
@@ -510,7 +549,7 @@ PriceUpdate(m, newMark, newOracle) ==
     /\ MarkPrice'   = [MarkPrice   EXCEPT ![m] = newMark]
     /\ OraclePrice' = [OraclePrice EXCEPT ![m] = newOracle]
     /\ UNCHANGED <<Balance, Position, EntryPrice, FundingRate, OrderBook,
-                   InsuranceFundPos>>
+                   InsuranceFundPos, InsuranceFundBalance>>
 
 (*
  * UpdateFundingRate(m, rate)
@@ -521,7 +560,7 @@ UpdateFundingRate(m, rate) ==
     /\ m \in Markets
     /\ FundingRate' = [FundingRate EXCEPT ![m] = rate]
     /\ UNCHANGED <<Balance, Position, EntryPrice, MarkPrice,
-                   OraclePrice, OrderBook, InsuranceFundPos>>
+                   OraclePrice, OrderBook, InsuranceFundPos, InsuranceFundBalance>>
 
 (*
  * ProcessFunding(a, m)
@@ -554,7 +593,7 @@ ProcessFunding(a, m) ==
               ELSE (* receiver: balance only increases, always safe *)
                    /\ Balance' = [Balance EXCEPT ![a] = @ + payment]
     /\ UNCHANGED <<Position, EntryPrice, MarkPrice, OraclePrice,
-                   FundingRate, OrderBook, InsuranceFundPos>>
+                   FundingRate, OrderBook, InsuranceFundPos, InsuranceFundBalance>>
 
 (*
  * Liquidate(a)
@@ -562,20 +601,26 @@ ProcessFunding(a, m) ==
  * Pre-condition: account has at least one open position AND is below maintenance
  *                margin (SufficientMargin is FALSE).
  *
- * The liquidated positions are transferred to InsuranceFundPos rather than
- * simply zeroed, so that NetPositionZero is preserved: every long still has
- * a corresponding short (now held by the insurance fund).
+ * The liquidated positions are transferred to InsuranceFundPos so that
+ * NetPositionZero is preserved.  The net equity impact on the insurance fund
+ * cash is LiquidationEquityDelta(a):
+ *   - Positive: account is solvent but undercollateralised; fund receives
+ *               the remaining equity as a cash surplus.
+ *   - Negative: account is bankrupt (losses exceed cash); fund absorbs the
+ *               deficit.  The guard InsuranceFundBalance + delta >= 0 prevents
+ *               any liquidation that would make the fund insolvent, preserving
+ *               the InsuranceFundSolvent invariant.
  *
- * Post-condition: all of a's positions and entry prices are zeroed; balance
- *                 is set to 0 (insurance fund absorbs any deficit).
- *                 HasOpenPosition(a) becomes FALSE, so MarginSafety is
- *                 vacuously satisfied after liquidation.
+ * Post-condition: a's positions and entry prices are zeroed; a's balance is
+ *                 zeroed (its net equity was transferred to the fund).
  *)
 Liquidate(a) ==
     /\ a \in Accounts
     /\ HasOpenPosition(a)
     /\ ~SufficientMargin(a)
-    (* Transfer all positions to the insurance fund, preserving NetPositionZero *)
+    /\ LET delta == LiquidationEquityDelta(a)
+       IN  /\ InsuranceFundBalance + delta >= 0  (* fund must be able to absorb deficit *)
+           /\ InsuranceFundBalance' = InsuranceFundBalance + delta
     /\ InsuranceFundPos' = [m \in Markets |->
                                 InsuranceFundPos[m] + Position[a][m]]
     /\ Position'   = [Position   EXCEPT ![a] = [m2 \in Markets |-> 0]]
@@ -627,5 +672,6 @@ THEOREM Spec => []MarkPricesPositive
 THEOREM Spec => []PricesTickAligned
 THEOREM Spec => []PositionEntryPriceConsistency
 THEOREM Spec => []NetPositionZero
+THEOREM Spec => []InsuranceFundSolvent
 
 =============================================================================
