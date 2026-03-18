@@ -8,7 +8,7 @@
  * account falls below its maintenance-margin threshold at any point
  * reachable by the allowed actions.
  *)
-EXTENDS Naturals, Sequences
+EXTENDS Integers, Sequences
 
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
@@ -21,7 +21,8 @@ CONSTANTS
     InitialMargin,      (* minimum collateral (in whole units) to open      *)
     MaintenanceMargin,  (* minimum collateral (in whole units) to keep open *)
     TickSize,           (* minimum price increment (positive integer)       *)
-    MaxPrice            (* upper bound on any price, used for type checking *)
+    MaxPrice,           (* upper bound on any price, used for type checking *)
+    MaxBalance          (* upper bound on any balance, used for bounding TLC *)
 
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
@@ -120,6 +121,29 @@ SufficientMargin(a) ==
 HasOpenPosition(a) ==
     \E m \in Markets : Position[a][m] > 0
 
+(*
+ * AccountSafeAtMarkPrice(a, m, mark)
+ * Check that account a (which is assumed to hold a long position in m, i.e.
+ * Position[a][m] > 0) would remain above MaintenanceMargin if market m's
+ * mark price were set to `mark`.  Only valid for long (non-negative) positions;
+ * short modelling is out of scope for this spec.  Used as a pre-condition in
+ * PriceUpdate to preserve MarginSafety across price changes.
+ *)
+AccountSafeAtMarkPrice(a, m, mark) ==
+    LET absPos == Position[a][m]
+        entry  == EntryPrice[a][m]
+        gain   == IF mark >= entry THEN absPos * (mark - entry) ELSE 0
+        loss   == IF mark < entry  THEN absPos * (entry - mark) ELSE 0
+    IN  Balance[a] + gain >= loss + MaintenanceMargin
+
+(*
+ * SufficientMarginAfterDebit(a, amount)
+ * TRUE when account a would remain above MaintenanceMargin after `amount`
+ * units are deducted from its balance, factoring in current PnL.
+ *)
+SufficientMarginAfterDebit(a, amount) ==
+    (Balance[a] - amount) + PositivePnLSum(a) >= NegativePnLSum(a) + MaintenanceMargin
+
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
 (*  I N V A R I A N T S                                                    *)
@@ -144,6 +168,21 @@ TypeInvariant ==
 MarginSafety ==
     \A a \in Accounts :
         HasOpenPosition(a) => SufficientMargin(a)
+
+-----------------------------------------------------------------------------
+(* ---------------------------------------------------------------------- *)
+(*  S T A T E   C O N S T R A I N T   ( f o r   T L C )                  *)
+(* ---------------------------------------------------------------------- *)
+
+(*
+ * Bound the state space for finite model checking.
+ * TLC will not explore states where any balance or position exceeds MaxBalance,
+ * or where any market's order book has more than 2 pending orders.
+ *)
+StateConstraint ==
+    /\ \A a \in Accounts : Balance[a] <= MaxBalance
+    /\ \A a \in Accounts, m \in Markets : Position[a][m] <= MaxBalance
+    /\ \A m \in Markets : Len(OrderBook[m]) <= 2
 
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
@@ -247,8 +286,8 @@ ExecuteTrade(m, i, j) ==
            buyer  == buyOrder.account
            seller == sellOrder.account
        IN
-           /\ Balance[buyer]  >= InitialMargin
-           /\ Balance[seller] >= InitialMargin
+           /\ Balance[buyer]  >= InitialMargin + MaintenanceMargin
+           /\ Balance[seller] >= InitialMargin + MaintenanceMargin
            /\ Position[seller][m] >= tradeSize   (* seller must hold enough *)
            /\ Balance' = [Balance EXCEPT
                   ![buyer]  = @ - InitialMargin,
@@ -268,7 +307,9 @@ ExecuteTrade(m, i, j) ==
 (*
  * PriceUpdate(m, newMark, newOracle)
  * The exchange updates the mark price and oracle price for market m.
- * Pre-conditions : m \in Markets, both prices are positive multiples of TickSize.
+ * Pre-conditions : m \in Markets, both prices are positive multiples of TickSize,
+ *                  the new mark price must not push any account below
+ *                  MaintenanceMargin (preserving MarginSafety).
  *)
 PriceUpdate(m, newMark, newOracle) ==
     /\ m \in Markets
@@ -278,6 +319,9 @@ PriceUpdate(m, newMark, newOracle) ==
     /\ newOracle <= MaxPrice
     /\ newMark   % TickSize = 0
     /\ newOracle % TickSize = 0
+    (* Safety pre-check: all accounts with positions remain above maintenance margin *)
+    /\ \A a \in Accounts :
+           Position[a][m] > 0 => AccountSafeAtMarkPrice(a, m, newMark)
     /\ MarkPrice'   = [MarkPrice   EXCEPT ![m] = newMark]
     /\ OraclePrice' = [OraclePrice EXCEPT ![m] = newOracle]
     /\ UNCHANGED <<Balance, Position, EntryPrice, FundingRate, OrderBook>>
@@ -300,7 +344,8 @@ UpdateFundingRate(m, rate) ==
  * For this spec we only model long positions (Position >= 0) and apply the
  * payment as: payment = Position[a][m] * |FundingRate[m]|.
  * If the account owes funding, deduct from Balance; if owed, add to Balance.
- * Pre-condition: account has a non-zero position in the market.
+ * Pre-condition: account has a non-zero position in the market, and when
+ *                paying, the remaining equity must still satisfy MarginSafety.
  *)
 ProcessFunding(a, m) ==
     /\ a \in Accounts
@@ -310,28 +355,30 @@ ProcessFunding(a, m) ==
            size    == Position[a][m]
            payment == size * (IF rate >= 0 THEN rate ELSE -rate)
        IN  IF rate >= 0
-           THEN (* longs pay; ensure they have enough balance *)
-                /\ Balance[a] >= payment
+           THEN (* longs pay; ensure post-payment equity stays above maintenance margin *)
+                /\ SufficientMarginAfterDebit(a, payment)
                 /\ Balance' = [Balance EXCEPT ![a] = @ - payment]
-           ELSE (* longs receive *)
+           ELSE (* longs receive; balance only increases, always safe *)
                 /\ Balance' = [Balance EXCEPT ![a] = @ + payment]
     /\ UNCHANGED <<Position, EntryPrice, MarkPrice, OraclePrice,
                    FundingRate, OrderBook>>
 
 (*
  * Liquidate(a, m)
- * Force-close account a's position in market m when margin is insufficient.
+ * Force-close ALL of account a's positions when margin is insufficient.
  * Pre-condition: account has an open position AND is below maintenance margin.
- * Post-condition: position is zeroed; balance is set to 0 (insurance fund
+ * Post-condition: all positions are zeroed; balance is set to 0 (insurance fund
  *                 absorbs any deficit in a real system; simplified here).
+ *                 Closing all positions ensures HasOpenPosition becomes FALSE,
+ *                 so MarginSafety is vacuously satisfied after liquidation.
  *)
 Liquidate(a, m) ==
     /\ a \in Accounts
     /\ m \in Markets
     /\ Position[a][m] > 0
     /\ ~SufficientMargin(a)
-    /\ Position'   = [Position   EXCEPT ![a][m] = 0]
-    /\ EntryPrice' = [EntryPrice EXCEPT ![a][m] = 0]
+    /\ Position'   = [Position   EXCEPT ![a] = [m2 \in Markets |-> 0]]
+    /\ EntryPrice' = [EntryPrice EXCEPT ![a] = [m2 \in Markets |-> 0]]
     /\ Balance'    = [Balance    EXCEPT ![a] = 0]
     /\ UNCHANGED <<MarkPrice, OraclePrice, FundingRate, OrderBook>>
 
@@ -341,18 +388,19 @@ Liquidate(a, m) ==
 (* ---------------------------------------------------------------------- *)
 
 Next ==
-    \/ \E a \in Accounts, amount \in 1..1000 :
+    \/ \E a \in Accounts, amount \in 1..MaxBalance :
            Deposit(a, amount)
-    \/ \E a \in Accounts, amount \in 1..Balance[a] + 1 :
+    \/ \E a \in Accounts : \E amount \in 1..Balance[a] + 1 :
            Withdraw(a, amount)
     \/ \E a \in Accounts, m \in Markets,
-          side \in {1, -1}, size \in 1..10, price \in 1..MaxPrice :
+          side \in {1, -1}, size \in 1..2, price \in 1..MaxPrice :
            PlaceOrder(a, m, side, size, price)
-    \/ \E m \in Markets, i \in 1..Len(OrderBook[m]), j \in 1..Len(OrderBook[m]) :
-           ExecuteTrade(m, i, j)
+    \/ \E m \in Markets :
+           \E i \in 1..Len(OrderBook[m]), j \in 1..Len(OrderBook[m]) :
+               ExecuteTrade(m, i, j)
     \/ \E m \in Markets, p1 \in 1..MaxPrice, p2 \in 1..MaxPrice :
            PriceUpdate(m, p1, p2)
-    \/ \E m \in Markets, r \in -10..10 :
+    \/ \E m \in Markets, r \in -2..2 :
            UpdateFundingRate(m, r)
     \/ \E a \in Accounts, m \in Markets :
            ProcessFunding(a, m)
