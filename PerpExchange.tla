@@ -144,6 +144,78 @@ AccountSafeAtMarkPrice(a, m, mark) ==
 SufficientMarginAfterDebit(a, amount) ==
     (Balance[a] - amount) + PositivePnLSum(a) >= NegativePnLSum(a) + MaintenanceMargin
 
+(*
+ * Min(a, b) — the smaller of two integers.
+ *)
+Min(a, b) == IF a <= b THEN a ELSE b
+
+(*
+ * BestBuyIdx(m) — index of the best (highest-price) resting buy order.
+ * Among orders with equal price the earliest (lowest index) is preferred,
+ * implementing strict price/time priority on the bid side.
+ * Returns 0 when there are no buy orders.
+ *)
+BestBuyIdx(m) ==
+    LET buys == {k \in DOMAIN OrderBook[m] : OrderBook[m][k].side = 1}
+    IN  IF buys = {} THEN 0
+        ELSE CHOOSE k \in buys :
+                 /\ \A l \in buys : OrderBook[m][k].price >= OrderBook[m][l].price
+                 /\ \A l \in buys :
+                        OrderBook[m][l].price = OrderBook[m][k].price => k <= l
+
+(*
+ * BestSellIdx(m) — index of the best (lowest-price) resting sell order.
+ * Among orders with equal price the earliest (lowest index) is preferred,
+ * implementing strict price/time priority on the ask side.
+ * Returns 0 when there are no sell orders.
+ *)
+BestSellIdx(m) ==
+    LET sells == {k \in DOMAIN OrderBook[m] : OrderBook[m][k].side = -1}
+    IN  IF sells = {} THEN 0
+        ELSE CHOOSE k \in sells :
+                 /\ \A l \in sells : OrderBook[m][k].price <= OrderBook[m][l].price
+                 /\ \A l \in sells :
+                        OrderBook[m][l].price = OrderBook[m][k].price => k <= l
+
+(*
+ * PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize)
+ * TRUE when the buyer's total equity (across all markets) remains above
+ * MaintenanceMargin after the trade.  The trade changes Balance and the
+ * position in market m; all other-market positions are untouched, so their
+ * PnL contribution is computed by subtracting out the pre-trade market-m
+ * contribution from the aggregate sums.
+ *)
+PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize) ==
+    LET newBal      == Balance[buyer] - InitialMargin
+        newPos      == Position[buyer][m] + tradeSize
+        newGainM    == IF MarkPrice[m] >= tradePrice THEN newPos * (MarkPrice[m] - tradePrice) ELSE 0
+        newLossM    == IF MarkPrice[m] <  tradePrice THEN newPos * (tradePrice - MarkPrice[m]) ELSE 0
+        oldGainM    == IF PnLPositive(buyer, m) THEN AbsPnL(buyer, m) ELSE 0
+        oldLossM    == IF ~PnLPositive(buyer, m) THEN AbsPnL(buyer, m) ELSE 0
+        otherGains  == PositivePnLSum(buyer) - oldGainM
+        otherLosses == NegativePnLSum(buyer) - oldLossM
+    IN  newBal + newGainM + otherGains >= newLossM + otherLosses + MaintenanceMargin
+
+(*
+ * PostTradeSellerSafe(seller, m, tradeSize)
+ * TRUE when the seller's total equity (across all markets) remains above
+ * MaintenanceMargin after the trade.  Entry price is preserved on partial
+ * exits and cleared on full close.  Other-market PnL is unchanged.
+ *)
+PostTradeSellerSafe(seller, m, tradeSize) ==
+    LET newBal      == Balance[seller] - InitialMargin
+        newPos      == Position[seller][m] - tradeSize
+        newEntry    == IF newPos = 0 THEN 0 ELSE EntryPrice[seller][m]
+        newGainM    == IF newPos > 0 /\ MarkPrice[m] >= newEntry
+                       THEN newPos * (MarkPrice[m] - newEntry) ELSE 0
+        newLossM    == IF newPos > 0 /\ MarkPrice[m] <  newEntry
+                       THEN newPos * (newEntry - MarkPrice[m]) ELSE 0
+        oldGainM    == IF PnLPositive(seller, m) THEN AbsPnL(seller, m) ELSE 0
+        oldLossM    == IF ~PnLPositive(seller, m) THEN AbsPnL(seller, m) ELSE 0
+        otherGains  == PositivePnLSum(seller) - oldGainM
+        otherLosses == NegativePnLSum(seller) - oldLossM
+    IN  newBal + newGainM + otherGains >= newLossM + otherLosses + MaintenanceMargin
+
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
 (*  I N V A R I A N T S                                                    *)
@@ -168,6 +240,32 @@ TypeInvariant ==
 MarginSafety ==
     \A a \in Accounts :
         HasOpenPosition(a) => SufficientMargin(a)
+
+(*
+ * MarkPricesPositive: mark prices are always strictly positive.
+ * This is guaranteed by PriceUpdate (newMark > 0) and Init (MarkPrice = TickSize).
+ *)
+MarkPricesPositive ==
+    \A m \in Markets : MarkPrice[m] > 0
+
+(*
+ * PricesTickAligned: mark and oracle prices are always multiples of TickSize.
+ * PlaceOrder enforces the same on order prices; this covers the exchange-side
+ * prices so every relevant price in the system is tick-aligned.
+ *)
+PricesTickAligned ==
+    \A m \in Markets :
+        /\ MarkPrice[m]   % TickSize = 0
+        /\ OraclePrice[m] % TickSize = 0
+
+(*
+ * PositionEntryPriceConsistency: a non-zero position always has a non-zero
+ * entry price and vice versa.  This is a key bookkeeping invariant: the two
+ * fields must be set and cleared together.
+ *)
+PositionEntryPriceConsistency ==
+    \A a \in Accounts, m \in Markets :
+        (Position[a][m] = 0) <=> (EntryPrice[a][m] = 0)
 
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
@@ -257,51 +355,74 @@ PlaceOrder(a, m, side, size, price) ==
                    OraclePrice, FundingRate>>
 
 (*
- * ExecuteTrade(m, i, j)
- * Match the i-th buy order against the j-th sell order in market m when
- * their prices cross.  Both orders must be on opposite sides and the buyer's
- * price must be >= the seller's price.  For simplicity the trade executes at
- * the seller's (ask) price and fully fills both orders.
+ * ExecuteTrade(m)
+ * Match the best resting buy order against the best resting sell order in
+ * market m, applying strict price/time priority:
+ *   - Best bid: highest buy price; ties broken by earliest placement (lowest index).
+ *   - Best ask: lowest sell price; ties broken by earliest placement (lowest index).
+ *
+ * The trade executes at the seller's (ask) price and fills
+ *   tradeSize = Min(buyOrder.size, sellOrder.size)
+ * units, leaving a partially-filled residual in the book when the two sizes
+ * differ.  Self-trading (buyer = seller) is prohibited.
  *
  * Post-conditions:
- *   - Positions of both accounts are updated (long +size, short −size with
- *     Nat encoding: short side decrements position of the existing long or
- *     is ignored in this simplified model where we only track long exposure).
- *   - Both orders are removed from the order book.
- *   - Balance of each party is reduced by the filled notional * InitialMargin
- *     rate (simplified: each pays InitialMargin as margin per trade).
+ *   - Buyer's position increases by tradeSize; entry price set to tradePrice.
+ *   - Seller's position decreases by tradeSize; entry price preserved on
+ *     partial exits and cleared to 0 on a full close.
+ *   - Both parties pay InitialMargin from their balance.
+ *   - The fully-consumed order is removed; the residual (if any) stays in the
+ *     book with its size reduced.  Order-book positions of surviving orders
+ *     are preserved; the partial residual is appended at the tail.
+ *   - Post-trade equity of each party must satisfy MaintenanceMargin.
  *)
-ExecuteTrade(m, i, j) ==
+ExecuteTrade(m) ==
     /\ m \in Markets
-    /\ i \in DOMAIN OrderBook[m]
-    /\ j \in DOMAIN OrderBook[m]
-    /\ i /= j
-    /\ OrderBook[m][i].side = 1    (* i is the buyer *)
-    /\ OrderBook[m][j].side = -1   (* j is the seller *)
-    /\ OrderBook[m][i].price >= OrderBook[m][j].price
-    /\ LET buyOrder  == OrderBook[m][i]
-           sellOrder == OrderBook[m][j]
-           tradePrice == sellOrder.price
-           tradeSize  == buyOrder.size
-           buyer  == buyOrder.account
-           seller == sellOrder.account
+    /\ LET i == BestBuyIdx(m)
+           j == BestSellIdx(m)
        IN
-           /\ Balance[buyer]  >= InitialMargin + MaintenanceMargin
-           /\ Balance[seller] >= InitialMargin + MaintenanceMargin
-           /\ Position[seller][m] >= tradeSize   (* seller must hold enough *)
-           /\ Balance' = [Balance EXCEPT
-                  ![buyer]  = @ - InitialMargin,
-                  ![seller] = @ - InitialMargin]
-           /\ Position' = [Position EXCEPT
-                  ![buyer][m]  = @ + tradeSize,
-                  ![seller][m] = @ - tradeSize]
-           /\ EntryPrice' = [EntryPrice EXCEPT
-                  ![buyer][m]  = tradePrice,
-                  ![seller][m] = tradePrice]
-           (* Remove both matched orders from the book using SelectSeq *)
-           /\ LET newSeq == SelectSeq(OrderBook[m],
-                                LAMBDA o : o /= OrderBook[m][i] /\ o /= OrderBook[m][j])
-              IN  OrderBook' = [OrderBook EXCEPT ![m] = newSeq]
+           /\ i > 0
+           /\ j > 0
+           /\ OrderBook[m][i].price >= OrderBook[m][j].price
+           /\ LET buyOrder   == OrderBook[m][i]
+                  sellOrder  == OrderBook[m][j]
+                  tradePrice == sellOrder.price
+                  tradeSize  == Min(buyOrder.size, sellOrder.size)
+                  buyer      == buyOrder.account
+                  seller     == sellOrder.account
+                  lo         == IF i < j THEN i ELSE j
+                  hi         == IF i < j THEN j ELSE i
+                  (* Remove both matched orders; re-add any partial residual. *)
+                  base       == SubSeq(OrderBook[m], 1, lo - 1)
+                                \o SubSeq(OrderBook[m], lo + 1, hi - 1)
+                                \o SubSeq(OrderBook[m], hi + 1, Len(OrderBook[m]))
+                  newBook    ==
+                      IF    buyOrder.size < sellOrder.size
+                      THEN  Append(base, [sellOrder EXCEPT !.size = @ - tradeSize])
+                      ELSE IF buyOrder.size > sellOrder.size
+                      THEN  Append(base, [buyOrder  EXCEPT !.size = @ - tradeSize])
+                      ELSE  base  (* both orders fully consumed *)
+              IN
+                  /\ buyer /= seller
+                  /\ Balance[buyer]  >= InitialMargin
+                  /\ Balance[seller] >= InitialMargin
+                  /\ Position[seller][m] >= tradeSize
+                  /\ PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize)
+                  /\ PostTradeSellerSafe(seller, m, tradeSize)
+                  /\ Balance' = [Balance EXCEPT
+                         ![buyer]  = @ - InitialMargin,
+                         ![seller] = @ - InitialMargin]
+                  /\ Position' = [Position EXCEPT
+                         ![buyer][m]  = @ + tradeSize,
+                         ![seller][m] = @ - tradeSize]
+                  /\ EntryPrice' = [EntryPrice EXCEPT
+                         ![buyer][m]  = tradePrice,
+                         (* Seller: preserve entry price on partial exit,
+                            clear to 0 when the position is fully closed. *)
+                         ![seller][m] = IF Position[seller][m] - tradeSize = 0
+                                        THEN 0
+                                        ELSE EntryPrice[seller][m]]
+                  /\ OrderBook' = [OrderBook EXCEPT ![m] = newBook]
     /\ UNCHANGED <<MarkPrice, OraclePrice, FundingRate>>
 
 (*
@@ -395,9 +516,7 @@ Next ==
     \/ \E a \in Accounts, m \in Markets,
           side \in {1, -1}, size \in 1..2, price \in 1..MaxPrice :
            PlaceOrder(a, m, side, size, price)
-    \/ \E m \in Markets :
-           \E i \in 1..Len(OrderBook[m]), j \in 1..Len(OrderBook[m]) :
-               ExecuteTrade(m, i, j)
+    \/ \E m \in Markets : ExecuteTrade(m)
     \/ \E m \in Markets, p1 \in 1..MaxPrice, p2 \in 1..MaxPrice :
            PriceUpdate(m, p1, p2)
     \/ \E m \in Markets, r \in -2..2 :
@@ -421,9 +540,12 @@ Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 (*
  * The type invariant and margin safety are the primary safety properties.
- * TLC can verify both for finite instantiations of the constants.
+ * TLC can verify all of the below for finite instantiations of the constants.
  *)
 THEOREM Spec => []TypeInvariant
 THEOREM Spec => []MarginSafety
+THEOREM Spec => []MarkPricesPositive
+THEOREM Spec => []PricesTickAligned
+THEOREM Spec => []PositionEntryPriceConsistency
 
 =============================================================================
