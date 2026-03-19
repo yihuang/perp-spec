@@ -1,0 +1,20 @@
+name: TLC Model Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+
+      - name: Check PerpExchange.tla
+        run: nix shell nixpkgs#tlaplus --command tlc -workers auto PerpExchange.tla
