@@ -18,7 +18,8 @@ EXTENDS Integers, Sequences
 CONSTANTS
     Accounts,           (* finite set of trader accounts                   *)
     Markets,            (* finite set of perpetual-contract markets         *)
-    InitialMargin,      (* minimum collateral (in whole units) to open      *)
+    InitialMargin,      (* initial-margin rate as a percentage (0-100);
+                           required collateral = CEIL(size * price * InitialMargin / 100) *)
     MaintenanceMargin,  (* minimum collateral (in whole units) to keep open *)
     TickSize,           (* minimum price increment (positive integer)       *)
     MaxPrice,           (* upper bound on any price, used for type checking *)
@@ -170,6 +171,21 @@ SufficientMarginAfterDebit(a, amount) ==
 Min(a, b) == IF a <= b THEN a ELSE b
 
 (*
+ * InitialMarginReq(size, price)
+ * The amount of collateral that must be available to open (or remain in) a
+ * position of `size` contracts at the given price.  Both `size` and `price`
+ * are positive integers (the caller ensures this).
+ *
+ * InitialMargin is a rate expressed as a whole-number percentage (0-100).
+ * The required collateral is computed as:
+ *   CEIL(size * price * InitialMargin / 100)
+ * using ceiling division (divisor = 100) so that even very small positions
+ * require at least 1 unit of collateral whenever InitialMargin > 0.
+ *)
+InitialMarginReq(size, price) ==
+    (size * price * InitialMargin + 99) \div 100
+
+(*
  * BestBuyIdx(m) — index of the best (highest-price) resting buy order.
  * Among orders with equal price the earliest (lowest index) is preferred,
  * implementing strict price/time priority on the bid side.
@@ -205,7 +221,7 @@ BestSellIdx(m) ==
  * for any non-zero resulting position.  Other-market PnL is unchanged.
  *)
 PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize) ==
-    LET newBal      == Balance[buyer] - InitialMargin
+    LET newBal      == Balance[buyer] - InitialMarginReq(tradeSize, tradePrice)
         newPos      == Position[buyer][m] + tradeSize
         absNew      == IF newPos >= 0 THEN newPos ELSE -newPos
         (* PnL at new position; entry price will be tradePrice if newPos /= 0 *)
@@ -233,7 +249,7 @@ PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize) ==
  * for any non-zero resulting position.  Other-market PnL is unchanged.
  *)
 PostTradeSellerSafe(seller, m, tradePrice, tradeSize) ==
-    LET newBal      == Balance[seller] - InitialMargin
+    LET newBal      == Balance[seller] - InitialMarginReq(tradeSize, tradePrice)
         newPos      == Position[seller][m] - tradeSize
         absNew      == IF newPos >= 0 THEN newPos ELSE -newPos
         (* PnL at new position; entry price will be tradePrice if newPos /= 0 *)
@@ -490,7 +506,7 @@ PlaceOrder(a, m, side, size, price) ==
     /\ size > 0
     /\ price > 0
     /\ price % TickSize = 0
-    /\ Balance[a] >= InitialMargin
+    /\ Balance[a] >= InitialMarginReq(size, price)
     /\ LET o == [account |-> a, side |-> side, size |-> size, price |-> price]
        IN  OrderBook' = [OrderBook EXCEPT ![m] = Append(@, o)]
     /\ UNCHANGED <<Balance, Position, EntryPrice, MarkPrice,
@@ -513,7 +529,7 @@ PlaceOrder(a, m, side, size, price) ==
  *   - Seller's position changes by -tradeSize (can go long → flat → short).
  *   - Entry price is set to tradePrice for any non-zero resulting position,
  *     or cleared to 0 when the position closes exactly to zero.
- *   - Both parties pay InitialMargin from their balance.
+ *   - Both parties pay InitialMarginReq(tradeSize, tradePrice) from their balance.
  *   - The fully-consumed order is removed; any partial residual is appended
  *     back with its size reduced.
  *   - Post-trade equity of each party must satisfy MaintenanceMargin.
@@ -548,14 +564,14 @@ ExecuteTrade(m) ==
                       ELSE  base  (* both orders fully consumed *)
                IN
                   /\ buyer /= seller
-                  /\ Balance[buyer]  >= InitialMargin
-                  /\ Balance[seller] >= InitialMargin
+                  /\ Balance[buyer]  >= InitialMarginReq(tradeSize, tradePrice)
+                  /\ Balance[seller] >= InitialMarginReq(tradeSize, tradePrice)
                   (* No seller position pre-condition: seller opens a new short if flat *)
                   /\ PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize)
                   /\ PostTradeSellerSafe(seller, m, tradePrice, tradeSize)
                   /\ Balance' = [Balance EXCEPT
-                         ![buyer]  = @ - InitialMargin,
-                         ![seller] = @ - InitialMargin]
+                         ![buyer]  = @ - InitialMarginReq(tradeSize, tradePrice),
+                         ![seller] = @ - InitialMarginReq(tradeSize, tradePrice)]
                   /\ Position' = [Position EXCEPT
                          ![buyer][m]  = newBuyerPos,
                          ![seller][m] = newSellerPos]
