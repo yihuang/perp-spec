@@ -221,9 +221,12 @@ BestSellIdx(m) ==
  * for any non-zero resulting position.  Other-market PnL is unchanged.
  *)
 PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize) ==
-    LET newBal      == Balance[buyer] - InitialMarginReq(tradeSize, tradePrice)
-        newPos      == Position[buyer][m] + tradeSize
+    LET newPos      == Position[buyer][m] + tradeSize
+        absOld      == IF Position[buyer][m] >= 0 THEN Position[buyer][m] ELSE -Position[buyer][m]
         absNew      == IF newPos >= 0 THEN newPos ELSE -newPos
+        (* Margin delta: positive = lock more margin; negative = release margin back *)
+        marginDelta == InitialMarginReq(absNew, tradePrice) - InitialMarginReq(absOld, tradePrice)
+        newBal      == Balance[buyer] - marginDelta
         (* PnL at new position; entry price will be tradePrice if newPos /= 0 *)
         newGainM    == IF newPos > 0 /\ MarkPrice[m] >= tradePrice
                        THEN absNew * (MarkPrice[m] - tradePrice)
@@ -249,9 +252,12 @@ PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize) ==
  * for any non-zero resulting position.  Other-market PnL is unchanged.
  *)
 PostTradeSellerSafe(seller, m, tradePrice, tradeSize) ==
-    LET newBal      == Balance[seller] - InitialMarginReq(tradeSize, tradePrice)
-        newPos      == Position[seller][m] - tradeSize
+    LET newPos      == Position[seller][m] - tradeSize
+        absOld      == IF Position[seller][m] >= 0 THEN Position[seller][m] ELSE -Position[seller][m]
         absNew      == IF newPos >= 0 THEN newPos ELSE -newPos
+        (* Margin delta: positive = lock more margin; negative = release margin back *)
+        marginDelta == InitialMarginReq(absNew, tradePrice) - InitialMarginReq(absOld, tradePrice)
+        newBal      == Balance[seller] - marginDelta
         (* PnL at new position; entry price will be tradePrice if newPos /= 0 *)
         newGainM    == IF newPos > 0 /\ MarkPrice[m] >= tradePrice
                        THEN absNew * (MarkPrice[m] - tradePrice)
@@ -295,8 +301,10 @@ SumPositions(m) ==
  *   impact on the fund's cash reserves is exactly `equity` (a negative
  *   number equal to -(shortfall)).
  *
- * Used both as the cash update in Liquidate and in the guard that prevents
- * liquidation when the fund cannot absorb the deficit.
+ * Used as the cash update applied in Liquidate: a positive delta means the
+ * fund gains the account's remaining equity (solvent-but-under-margin case);
+ * a negative delta means the fund absorbs the bankruptcy shortfall (floored
+ * at 0, with any remaining deficit resolved via ADL).
  *)
 LiquidationEquityDelta(a) ==
     Balance[a] + PositivePnLSum(a) - NegativePnLSum(a)
@@ -315,9 +323,7 @@ TypeInvariant ==
     /\ FundingRate          \in [Markets -> -100..100]
     /\ InsuranceFundPos     \in [Markets -> Int]
     /\ InsuranceFundBalance \in Int
-    /\ \A m \in Markets :
-           \A i \in DOMAIN OrderBook[m] :
-               OrderBook[m][i] \in Order
+    /\ OrderBook            \in [Markets -> Seq(Order)]
 
 (*
  * MarginSafety: every account with an open position must be above the
@@ -529,9 +535,12 @@ PlaceOrder(a, m, side, size, price) ==
  *   - Seller's position changes by -tradeSize (can go long → flat → short).
  *   - Entry price is set to tradePrice for any non-zero resulting position,
  *     or cleared to 0 when the position closes exactly to zero.
- *   - Both parties pay InitialMarginReq(tradeSize, tradePrice) from their balance.
- *   - The fully-consumed order is removed; any partial residual is appended
- *     back with its size reduced.
+ *   - Margin is charged/released based on the net change in absolute position
+ *     size: opening/increasing a position locks more margin; closing/reducing
+ *     releases margin back.  The margin delta is computed using the trade price
+ *     so the requirement is notional-based (size × price × InitialMargin%).
+ *   - The fully-consumed order is removed from the book.  Any partial residual
+ *     remains at its original book position (preserving time priority).
  *   - Post-trade equity of each party must satisfy MaintenanceMargin.
  *)
 ExecuteTrade(m) ==
@@ -550,28 +559,42 @@ ExecuteTrade(m) ==
                   seller        == sellOrder.account
                   newBuyerPos   == Position[buyer][m]  + tradeSize
                   newSellerPos  == Position[seller][m] - tradeSize
+                  (* Absolute position sizes for margin-delta computation *)
+                  buyerAbsOld   == IF Position[buyer][m]  >= 0 THEN  Position[buyer][m]  ELSE -Position[buyer][m]
+                  buyerAbsNew   == IF newBuyerPos          >= 0 THEN  newBuyerPos         ELSE -newBuyerPos
+                  sellerAbsOld  == IF Position[seller][m] >= 0 THEN  Position[seller][m] ELSE -Position[seller][m]
+                  sellerAbsNew  == IF newSellerPos         >= 0 THEN  newSellerPos        ELSE -newSellerPos
+                  (* Positive delta = lock more collateral; negative = release collateral *)
+                  buyerMarginDelta  == InitialMarginReq(buyerAbsNew,  tradePrice) - InitialMarginReq(buyerAbsOld,  tradePrice)
+                  sellerMarginDelta == InitialMarginReq(sellerAbsNew, tradePrice) - InitialMarginReq(sellerAbsOld, tradePrice)
                   lo            == IF i < j THEN i ELSE j
                   hi            == IF i < j THEN j ELSE i
-                  (* Remove both matched orders; re-add any partial residual. *)
-                  base          == SubSeq(OrderBook[m], 1, lo - 1)
-                                   \o SubSeq(OrderBook[m], lo + 1, hi - 1)
-                                   \o SubSeq(OrderBook[m], hi + 1, Len(OrderBook[m]))
+                  (* Keep the partially-filled residual at its original book position.
+                     Only the fully-consumed order is removed. *)
                   newBook       ==
-                      IF    buyOrder.size < sellOrder.size
-                      THEN  Append(base, [sellOrder EXCEPT !.size = @ - tradeSize])
-                      ELSE IF buyOrder.size > sellOrder.size
-                      THEN  Append(base, [buyOrder  EXCEPT !.size = @ - tradeSize])
-                      ELSE  base  (* both orders fully consumed *)
+                      IF buyOrder.size = sellOrder.size
+                      THEN (* both fully consumed: remove both *)
+                           SubSeq(OrderBook[m], 1, lo - 1)
+                           \o SubSeq(OrderBook[m], lo + 1, hi - 1)
+                           \o SubSeq(OrderBook[m], hi + 1, Len(OrderBook[m]))
+                      ELSE IF buyOrder.size < sellOrder.size
+                      THEN (* buyer fully consumed; update seller in-place then remove buyer *)
+                           LET book1 == [OrderBook[m] EXCEPT ![j] = [@ EXCEPT !.size = @ - tradeSize]]
+                           IN  SubSeq(book1, 1, i - 1) \o SubSeq(book1, i + 1, Len(book1))
+                      ELSE (* seller fully consumed; update buyer in-place then remove seller *)
+                           LET book1 == [OrderBook[m] EXCEPT ![i] = [@ EXCEPT !.size = @ - tradeSize]]
+                           IN  SubSeq(book1, 1, j - 1) \o SubSeq(book1, j + 1, Len(book1))
                IN
                   /\ buyer /= seller
-                  /\ Balance[buyer]  >= InitialMarginReq(tradeSize, tradePrice)
-                  /\ Balance[seller] >= InitialMarginReq(tradeSize, tradePrice)
+                  (* When delta < 0 (position reduces), this always holds since Balance >= 0 *)
+                  /\ Balance[buyer]  >= buyerMarginDelta
+                  /\ Balance[seller] >= sellerMarginDelta
                   (* No seller position pre-condition: seller opens a new short if flat *)
                   /\ PostTradeBuyerSafe(buyer, m, tradePrice, tradeSize)
                   /\ PostTradeSellerSafe(seller, m, tradePrice, tradeSize)
                   /\ Balance' = [Balance EXCEPT
-                         ![buyer]  = @ - InitialMarginReq(tradeSize, tradePrice),
-                         ![seller] = @ - InitialMarginReq(tradeSize, tradePrice)]
+                         ![buyer]  = @ - buyerMarginDelta,
+                         ![seller] = @ - sellerMarginDelta]
                   /\ Position' = [Position EXCEPT
                          ![buyer][m]  = newBuyerPos,
                          ![seller][m] = newSellerPos]
@@ -613,6 +636,7 @@ PriceUpdate(m, newMark, newOracle) ==
  *)
 UpdateFundingRate(m, rate) ==
     /\ m \in Markets
+    /\ rate \in -100..100
     /\ FundingRate' = [FundingRate EXCEPT ![m] = rate]
     /\ UNCHANGED <<Balance, Position, EntryPrice, MarkPrice,
                    OraclePrice, OrderBook, InsuranceFundPos, InsuranceFundBalance>>
@@ -704,7 +728,7 @@ Liquidate(a) ==
 Next ==
     \/ \E a \in Accounts, amount \in 1..MaxBalance :
            Deposit(a, amount)
-    \/ \E a \in Accounts : \E amount \in 1..Balance[a] + 1 :
+    \/ \E a \in Accounts : \E amount \in 1..Balance[a] :
            Withdraw(a, amount)
     \/ \E a \in Accounts, m \in Markets,
           side \in {1, -1}, size \in 1..2, price \in 1..MaxPrice :
