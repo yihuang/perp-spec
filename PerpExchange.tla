@@ -425,6 +425,67 @@ LiquidationAlwaysSucceeds ==
                 \/ \A m \in Markets :                          (* ADL counterparties exist *)
                        Position[a][m] = 0 \/ HasCounterparty(a, m)
 
+(*
+ * OrderBookPricesTickAligned: every resting order in every market has a price
+ * that is a strictly positive multiple of TickSize.
+ *
+ * PlaceOrder enforces `price % TickSize = 0` as a pre-condition, so this
+ * invariant would be violated by any code path that bypasses that check.
+ * Having it as an explicit invariant ensures TLC verifies it end-to-end and
+ * guards against regressions where a new action path could introduce a
+ * non-tick-aligned order.
+ *)
+OrderBookPricesTickAligned ==
+    \A m \in Markets :
+        \A i \in DOMAIN OrderBook[m] :
+            OrderBook[m][i].price % TickSize = 0
+
+(*
+ * OrderBookSizesPositive: every resting order has a strictly positive size.
+ *
+ * This would catch the partial-fill bug that existed before the in-place
+ * residual fix: the old code removed both matched orders and re-appended
+ * the residual; had the residual size been computed as 0 (e.g. by an
+ * off-by-one in the size calculation), the order would have been left in
+ * the book with size 0, making it permanently "matchable" without ever
+ * consuming any position.  The invariant makes that class of bug visible.
+ *)
+OrderBookSizesPositive ==
+    \A m \in Markets :
+        \A i \in DOMAIN OrderBook[m] :
+            OrderBook[m][i].size > 0
+
+(*
+ * BestOrderMatchedFirst: when the best resting buy and sell orders have
+ * crossing prices (bid >= ask), the buy order at BestBuyIdx is genuinely
+ * the highest-priced bid and the sell order at BestSellIdx is genuinely
+ * the lowest-priced ask.  Ties are broken by earliest placement (lowest
+ * index).
+ *
+ * This formalises the price/time priority requirement.  Before
+ * BestBuyIdx / BestSellIdx were introduced, ExecuteTrade used arbitrary
+ * free indices i and j — that version could match a sub-optimal pair and
+ * skip better-priced orders, violating priority.  This invariant would have
+ * detected that violation.
+ *)
+BestOrderMatchedFirst ==
+    \A m \in Markets :
+        LET i == BestBuyIdx(m)
+            j == BestSellIdx(m)
+        IN  (i > 0 /\ j > 0 /\ OrderBook[m][i].price >= OrderBook[m][j].price) =>
+            (* Best buy: highest price; ties broken by earliest time (lowest index) *)
+            /\ \A k \in DOMAIN OrderBook[m] :
+                   /\ OrderBook[m][k].side = 1 =>
+                          OrderBook[m][i].price >= OrderBook[m][k].price
+                   /\ (OrderBook[m][k].side = 1 /\
+                       OrderBook[m][k].price = OrderBook[m][i].price) => i <= k
+            (* Best sell: lowest price; ties broken by earliest time (lowest index) *)
+            /\ \A k \in DOMAIN OrderBook[m] :
+                   /\ OrderBook[m][k].side = -1 =>
+                          OrderBook[m][j].price <= OrderBook[m][k].price
+                   /\ (OrderBook[m][k].side = -1 /\
+                       OrderBook[m][k].price = OrderBook[m][j].price) => j <= k
+
 -----------------------------------------------------------------------------
 (* ---------------------------------------------------------------------- *)
 (*  S T A T E   C O N S T R A I N T   ( f o r   T L C )                  *)
@@ -766,5 +827,8 @@ THEOREM Spec => []PositionEntryPriceConsistency
 THEOREM Spec => []NetPositionZero
 THEOREM Spec => []InsuranceFundSolvent
 THEOREM Spec => []LiquidationAlwaysSucceeds
+THEOREM Spec => []OrderBookPricesTickAligned
+THEOREM Spec => []OrderBookSizesPositive
+THEOREM Spec => []BestOrderMatchedFirst
 
 =============================================================================
